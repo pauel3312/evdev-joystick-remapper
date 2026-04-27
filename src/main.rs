@@ -2,15 +2,14 @@ mod id_pool;
 
 use id_pool::IdPool;
 
-use evdev::{Device, InputEvent, EventType, AbsoluteAxisCode, AbsInfo, UinputAbsSetup, FFEffectCode, AttributeSet, EventSummary, InputId, BusType, KeyCode, FFEffectData};
+use evdev::{AbsoluteAxisCode, AbsInfo, UinputAbsSetup, FFEffectCode, AttributeSet, EventSummary, InputId, BusType, KeyCode, FFEffectData};
 use evdev::uinput::VirtualDevice;
+use hidapi::{HidApi, HidDevice};
 
 
 use std::os::unix::io::AsRawFd;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -48,29 +47,13 @@ fn linear_map(
     rt.clamp(out_min, out_max)
 }
 
-type MapFn = fn(i32) -> i32;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // --- Find devices ---
-    let mut ursa_minor = None;
-    let mut twcs = None;
+    let api = HidApi::new()?;
 
-    for (path, dev) in evdev::enumerate() {
-        let name = dev.name().unwrap_or("Unknown");
-        println!("{} -> {}", path.display(), name);
-
-        if name == "Winwing WINCTRL URSA MINOR Combat Joystick R" {
-            ursa_minor = Some(dev);
-        } else if name == "Thrustmaster TWCS Throttle" {
-            twcs = Some(dev);
-        }
-    }
-
-    let ursa_minor = ursa_minor.expect("URSA MINOR not found");
-    let twcs = twcs.expect("TWCS not found");
+    let ursa_minor_hidraw = api.open(0x4098, 0xbc2a)?;
 
     let mut ff = AttributeSet::<FFEffectCode>::new();
     ff.insert(FFEffectCode::FF_RUMBLE);
@@ -96,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     // --- Create virtual device ---
-    let vdev = VirtualDevice::builder()?
+    let mut vdev = VirtualDevice::builder()?
         .name("Combined Virtual Device")
         .with_absolute_axis(
             &UinputAbsSetup::new(
@@ -118,164 +101,119 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     set_nonblocking(&vdev)?;
 
-
-    println!("Virtual device created");
+    println!("Found {}", ursa_minor_hidraw.get_device_info()?.product_string().unwrap());
+    println!("Virtual device created at {}", vdev.get_syspath()?.to_str().unwrap());
     println!("Starting input merger… Press Ctrl+C to exit.");
 
-    let vdev = Arc::new(Mutex::new(vdev));
+    let mut effects_map = IdPool::new();
+    let mut curr_effect: Option<FFEffectData> = None;
 
-    // --- Axis mapping ---
-    let mut axis_map: HashMap<(u8, AbsoluteAxisCode), (AbsoluteAxisCode, MapFn)> =
-        HashMap::new();
-
-    axis_map.insert(
-        (2, AbsoluteAxisCode::ABS_Z),
-        (
-            AbsoluteAxisCode::ABS_THROTTLE,
-            |v| linear_map(v, 950, 62000, -32767, 32767, true),
-        ),
-    );
-
-    axis_map.insert(
-        (1, AbsoluteAxisCode::ABS_THROTTLE),
-        (
-            AbsoluteAxisCode::ABS_BRAKE,
-            |v| linear_map(v, 0, 4095, -32767, 32767, true),
-        ),
-    );
-
-    let axis_map = Arc::new(axis_map);
+    let handler = HidEffectHandler::new(ursa_minor_hidraw);
 
 
-    let spawn_out_handler = |mut dev: Device, device_id: u8| {
-        let vdev = Arc::clone(&vdev);
-        let axis_map = Arc::clone(&axis_map);
+    loop {
+        thread::sleep(Duration::from_millis(10));
+        let events = {
+            // let mut vdev = vdev_orig.lock().unwrap();
+            match vdev.fetch_events() {
+                Ok(iter) => iter.collect::<Vec<_>>(),
 
-        thread::spawn(move || loop {
-            if let Ok(events) = dev.fetch_events() {
-                for ev in events {
-                    if ev.event_type() == EventType::ABSOLUTE {
-                        let axis = AbsoluteAxisCode(ev.code());
-                        if let Some((target, map_fn)) =
-                            axis_map.get(&(device_id, axis))
-                        {
-                            println!("{}", ev.value());
-                            let value = map_fn(ev.value());
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // No events available right now → this is NORMAL
+                    continue;
+                }
 
-                            let mut v = vdev.lock().unwrap();
+                Err(e) => {
+                    eprintln!("fetch_events error: {}", e);
+                    continue;
+                }
+            }
+        };
+        for event in events {
+            match event.destructure() {
+                EventSummary::UInput(uinput_ev, code, _) => {
 
-                            v.emit(&[InputEvent::new(
-                                EventType::ABSOLUTE.0,
-                                target.0,
-                                value,
-                            )])
-                                .unwrap();
+                    match code {
+                        evdev::UInputCode::UI_FF_UPLOAD => {
+                            // println!("FF upload");
+                            match vdev.process_ff_upload(uinput_ev) {
+                                Ok(mut upload) => {
+                                    // println!("Effect: {:?}", upload.effect());
+
+                                    let id: i16;
+                                    if args.rewired {
+                                        id = 0;
+                                        curr_effect = Some(upload.effect());
+                                    } else {
+                                        id = effects_map.insert(upload.effect());
+                                    }
+                                    upload.set_effect_id(id);
+                                    upload.set_retval(0);
+                                }
+                                Err(e) => {
+                                    eprintln!("upload error: {}", e);
+                                }
+                            }
+                        }
+
+                        evdev::UInputCode::UI_FF_ERASE => {
+                            // println!("FF erase");
+                            match vdev.process_ff_erase(uinput_ev) {
+                                Ok(mut erase) => {
+                                    // println!("Erase id={}", erase.effect_id());
+                                    if args.rewired {continue}
+                                    effects_map.remove(erase.effect_id() as i16);
+                                    erase.set_retval(0);
+                                }
+                                Err(e) => {
+                                    eprintln!("erase error: {}", e);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+
+                EventSummary::ForceFeedback(_ev, code, value) => {
+                    // println!("FF play/stop: {:?}: {:x}, {}",ev, code.0, value);
+                    match code {
+                        FFEffectCode::FF_RUMBLE => {}
+                        FFEffectCode::FF_PERIODIC => {}
+                        FFEffectCode::FF_SPRING => {}
+                        FFEffectCode::FF_DAMPER => {}
+                        FFEffectCode::FF_SINE => {}
+                        FFEffectCode::FF_CONSTANT => {}
+                        FFEffectCode::FF_CUSTOM => {}
+                        FFEffectCode::FF_GAIN => {}
+                        _ => {
+                            if args.rewired{
+                                if curr_effect == None { continue };
+                                handler.send_effect(&(curr_effect.unwrap()), value != 0)?;
+                            } else {
+                                let effect = effects_map.get(code.0 as i16).unwrap();
+                                handler.send_effect(effect, value != 0)?;
+                            }
                         }
                     }
                 }
+
+                _ => {}
             }
-        })
-    };
-
-    spawn_out_handler(ursa_minor, 1);
-    spawn_out_handler(twcs, 2);
-    spawn_ff_thread(vdev, args.rewired);
-
-    loop {
-        thread::park();
+        }
     }
 }
 
-fn spawn_ff_thread(
-    vdev_orig: Arc<Mutex<VirtualDevice>>,
-    rewired: bool
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut effects_map = IdPool::new();
-        let mut curr_effect: Option<FFEffectData> = None;
+fn gen_ursa_minor_vib_bytes(vib: u8) -> [u8; 14] {
+    [
+        0x02, 0x0a, 0xbf, 0x00, 0x00, 0x03, 0x49, 0x00, vib, 0x00, 0x00, 0x00, 0x00, 0x00
+    ]
+}
 
-        loop {
-            thread::sleep(Duration::from_millis(10));
-            let events = {
-                let mut vdev = vdev_orig.lock().unwrap();
-                match vdev.fetch_events() {
-                    Ok(iter) => iter.collect::<Vec<_>>(),
-
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        // No events available right now → this is NORMAL
-                        continue;
-                    }
-
-                    Err(e) => {
-                        eprintln!("fetch_events error: {}", e);
-                        continue;
-                    }
-                }
-            };
-            for event in events {
-                match event.destructure() {
-                    EventSummary::ForceFeedback(ev, code, value) => {
-                        println!("FF play/stop: {:?}: {:x}, {}",ev, code.0, value);
-                        if rewired{
-                            if curr_effect == None { continue };
-                            handle_effect(curr_effect.unwrap())
-                        } else {
-                            let effect = effects_map.get(code.0 as i16).unwrap();
-                            handle_effect(*effect);
-                        }
-                    }
-
-                    EventSummary::UInput(uinput_ev, code, _) => {
-
-                        match code {
-                            evdev::UInputCode::UI_FF_UPLOAD => {
-                                println!("FF upload");
-                                let mut vdev = vdev_orig.lock().unwrap();
-                                match vdev.process_ff_upload(uinput_ev) {
-                                    Ok(mut upload) => {
-                                        println!("Effect: {:?}", upload.effect());
-
-                                        let id: i16;
-                                        if rewired {
-                                            id = 0;
-                                            curr_effect = Some(upload.effect());
-                                        } else {
-                                            id = effects_map.insert(upload.effect());
-                                        }
-                                        upload.set_effect_id(id);
-                                        upload.set_retval(0);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("upload error: {}", e);
-                                    }
-                                }
-                            }
-
-                            evdev::UInputCode::UI_FF_ERASE => {
-                                println!("FF erase");
-                                let mut vdev = vdev_orig.lock().unwrap();
-                                match vdev.process_ff_erase(uinput_ev) {
-                                    Ok(mut erase) => {
-                                        println!("Erase id={}", erase.effect_id());
-                                        if rewired {continue}
-                                        effects_map.remove(erase.effect_id() as i16);
-                                        erase.set_retval(0);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("erase error: {}", e);
-                                    }
-                                }
-                            }
-
-                            _ => {}
-                        }
-                    }
-
-                    _ => {}
-                }
-            }
-        }
-    })
+fn gen_ursa_minor_light_bytes(light: u8) -> [u8; 14] {
+    [
+        0x2, 0x20, 0xbb, 0x0, 0x0, 0x3, 0x49, 0x0, light, 0x0, 0x0, 0x0, 0x0, 0x0
+    ]
 }
 
 fn set_nonblocking(dev: &VirtualDevice) -> std::io::Result<()> {
@@ -291,5 +229,40 @@ fn set_nonblocking(dev: &VirtualDevice) -> std::io::Result<()> {
     Ok(())
 }
 
+struct HidEffectHandler {
+    device: HidDevice,
+}
+impl HidEffectHandler {
+    pub fn new(device: HidDevice) -> Self {
+        Self { device }
+    }
 
-fn handle_effect(_: FFEffectData){} // TODO
+    pub fn send_effect(&self, effect: &FFEffectData, value: bool) -> Result<(), Box<dyn std::error::Error>> {
+        match effect.kind {
+            evdev::FFEffectKind::Rumble {
+                strong_magnitude, weak_magnitude
+            } => {
+                let bytes: [u8; 14];
+                if value {
+                    let strong_amount = strong_magnitude as f64/u16::MAX as f64;
+                    let weak_amount = weak_magnitude as f64/u16::MAX as f64;
+                    let total = ((3f64*strong_amount + weak_amount)/3f64).clamp(0.0, 1.0);
+                    let val = (total*u8::MAX as f64) as u8;
+                    // println!("weak: {}, strong: {}, out: {}", weak_magnitude, strong_magnitude, val);
+                    bytes = gen_ursa_minor_vib_bytes(val);
+                }
+                else{
+                    bytes = gen_ursa_minor_vib_bytes(0x00);
+                }
+                // for i in 0..14{
+                //     print!("{:02X} ", bytes[i]);
+                // }
+                // println!();
+                self.device.write(&bytes)?;
+            },
+            _ => {}
+
+        }
+        Ok(())
+    }
+}
