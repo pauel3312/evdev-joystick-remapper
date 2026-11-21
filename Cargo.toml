@@ -3,8 +3,14 @@ name = "evdev-joystick-remapper"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"
-nix = "0.29.0"
+nix = { version = "0.32.0", features = ["fs"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+vigem-rust = { version = "0.2", default-features = false, features = ["x360"] }
+
+[dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 hidapi = "2.6.5"
+cfg-if = "1.0.5"
