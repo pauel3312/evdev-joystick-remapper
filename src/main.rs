@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handler = HidEffectHandler::new(ursa_minor_hidraw);
 
     #[cfg(target_os = "linux")]
-    return crate::linux::main(args, handler);
+    return linux::main(args, handler);
     #[cfg(target_os = "windows")]
     return windows::main(args, handler);
 }

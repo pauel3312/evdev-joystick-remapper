@@ -1,9 +1,16 @@
-use std::thread;
-use std::time::Duration;
-use vigem_rust::{Client, X360Report};
-use crate::Args;
-use crate::common::{HidEffectHandler, gen_ursa_minor_vib_bytes};
+use cfg_if::cfg_if;
 
+cfg_if!{
+    if #[cfg(target_os = "windows")]{
+        use std::thread;
+        use std::time::Duration;
+        use vigem_rust::{Client, X360Report};
+        use crate::Args;
+        use crate::common::{HidEffectHandler, gen_ursa_minor_vib_bytes};
+    }
+}
+
+#[cfg(target_os = "windows")]
 pub fn main(args: Args, handler: HidEffectHandler) -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::connect()?;
     println!("Connected to ViGEmBus");

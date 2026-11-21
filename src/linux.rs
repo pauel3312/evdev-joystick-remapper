@@ -3,18 +3,15 @@ use cfg_if::cfg_if;
 cfg_if! {
     if #[cfg(target_os = "linux")] {
         use std::io::ErrorKind;
-        use crate::common::HidEffectHandler;
-        use std::io::ErrorKind;
         use std::thread;
         use std::time::Duration;
-        use hidapi::HidApi;
-        use crate::{Args, common::HidEffectHandler, common::gen_ursa_minor_vib_bytes};
+        use crate::{Args, common::HidEffectHandler};
 
         use evdev::{AbsoluteAxisCode, AbsInfo, UinputAbsSetup, FFEffectCode, AttributeSet, EventSummary, InputId, BusType, KeyCode, FFEffectData};
         use evdev::uinput::VirtualDevice;
-        use id_pool::IdPool;
+        use crate::id_pool::IdPool;
 
-        use std::os::unix::io::AsRawFd;
+        use std::os::unix::io::AsFd;
         use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
     }
@@ -22,20 +19,18 @@ cfg_if! {
 
 #[cfg(target_os = "linux")]
 fn set_nonblocking(dev: &VirtualDevice) -> std::io::Result<()> {
-    let fd = dev.as_raw_fd();
+    let fd = dev.as_fd();
 
-    let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+    let flags = OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL)?);
 
-    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+    fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
         .map_err(|e| std::io::Error::new(ErrorKind::Other, e))?;
 
     Ok(())
 }
 
-
 #[cfg(target_os = "linux")]
-fn main(args: Args, handler: &HidEffectHandler) -> Result<(), Box<dyn std::error::Error>> {
-
+pub fn main(args: Args, handler: HidEffectHandler) -> Result<(), Box<dyn std::error::Error>> {
     let mut ff = AttributeSet::<FFEffectCode>::new();
     ff.insert(FFEffectCode::FF_RUMBLE);
     ff.insert(FFEffectCode::FF_CUSTOM);
@@ -75,13 +70,13 @@ fn main(args: Args, handler: &HidEffectHandler) -> Result<(), Box<dyn std::error
         .input_id(InputId::new(BusType::BUS_USB, 0x045e, 0x028e, 0x0110))
         .build()?;
 
-    crate::set_nonblocking(&vdev)?;
+    set_nonblocking(&vdev)?;
 
     println!(
         "Virtual device created at {}",
         vdev.get_syspath()?.to_str().unwrap()
     );
-    println!("Starting input merger… Press Ctrl+C to exit.");
+    println!("Starting vibration forwarder… Press Ctrl+C to exit.");
 
     let mut effects_map = IdPool::new();
     let mut curr_effect: Option<FFEffectData> = None;
