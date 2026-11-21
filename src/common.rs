@@ -4,8 +4,6 @@ cfg_if! {
     if #[cfg(target_os = "linux")]
         {
         use evdev::FFEffectData;
-        use evdev::{AbsoluteAxisCode, AbsInfo, UinputAbsSetup, FFEffectCode, AttributeSet, EventSummary, InputId, BusType, KeyCode, FFEffectData};
-        use evdev::uinput::VirtualDevice;
     }
 }
 
