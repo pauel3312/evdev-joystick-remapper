@@ -144,7 +144,7 @@ pub fn main(args: Args, handler: HidEffectHandler) -> Result<(), Box<dyn std::er
                     }
                 }
 
-                EventSummary::ForceFeedback(_ev, code, value) => {
+                EventSummary::ForceFeedback(ev, code, value) => {
                     if args.verbose {
                         println!("FF play/stop: {:?}: {:x}, {}", ev, code.0, value);
                     }
