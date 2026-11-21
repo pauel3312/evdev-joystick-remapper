@@ -150,7 +150,9 @@ fn main(args: Args, handler: &HidEffectHandler) -> Result<(), Box<dyn std::error
                 }
 
                 EventSummary::ForceFeedback(_ev, code, value) => {
-                    // println!("FF play/stop: {:?}: {:x}, {}",ev, code.0, value);
+                    if args.verbose {
+                        println!("FF play/stop: {:?}: {:x}, {}", ev, code.0, value);
+                    }
                     match code {
                         FFEffectCode::FF_RUMBLE => {}
                         FFEffectCode::FF_PERIODIC => {}
